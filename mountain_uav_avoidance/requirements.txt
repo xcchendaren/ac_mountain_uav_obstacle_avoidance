@@ -1,0 +1,9 @@
+# 山区无人机避障仿真软件依赖库
+PyQt5>=5.15.9          # 界面开发
+matplotlib>=3.7.1      # 3D可视化
+numpy>=1.24.3          # 数值计算
+torch>=2.0.1           # 强化学习算法
+stable-baselines3>=2.0.0 # RL环境封装
+gymnasium>=0.28.1      # 强化学习环境
+pandas>=2.0.1          # 数据处理
+scipy>=1.10.1          # 科学计算
