@@ -4,7 +4,8 @@
 封装训练启动、暂停、数据保存等控制逻辑，集成真实 UAVEnv 和 ACAgent。
 修正：递归调度、适配新动作接口、模型保存路径独立。
 新增：保存扩展轨迹（13维），收集每轮统计指标（含奖励成分分析）。
-新增：模型和缓冲区保存到配置文件夹（与训练过程文件夹并列），实现跨训练过程经验继承。
+新增：使用 CheckpointManager 统一管理模型、缓冲区和轨迹的保存与加载。
+新增：支持中文路径，所有路径使用 pathlib.Path 处理。
 新增：支持自定义模型保存路径，允许用户在训练前指定模型和经验文件的保存位置。
 新增：save_experience_only 方法，仅保存经验缓冲区。
 新增：自动创建空白经验文件，确保训练开始前经验文件存在。
@@ -23,6 +24,7 @@ from pathlib import Path
 from PyQt5.QtCore import QObject, pyqtSignal, QTimer
 
 from business.file_manager import FileManager
+from business.checkpoint_manager import CheckpointManager
 from data.serializer import save_npy
 from algorithm.ac_agent import ACAgent
 from algorithm.uav_env import UAVEnv
@@ -65,6 +67,9 @@ class TrainController(QObject):
         self.run_index = run_index
         self.save_dir = Path(save_dir).resolve() if save_dir else None
 
+        # 检查点管理器（统一管理模型、缓冲区、轨迹保存）
+        self.checkpoint_manager = CheckpointManager(str(file_manager.get_root_dir()))
+
         self.is_training = False
         self.is_paused = False
         self.current_epoch = 0
@@ -79,6 +84,11 @@ class TrainController(QObject):
 
         # 持续训练模式标志
         self.continuous_mode = False
+
+        # ===== 探索退火配置 =====
+        # exploration_init: 初始探索偏置（加到 log_std 上，正值增大探索）
+        self.exploration_init = getattr(job_config.training, 'exploration_init', 1.5)
+        # ===== 探索退火结束 =====
 
         # 用于递归调度的标志
         self._pending_call = False
@@ -132,18 +142,26 @@ class TrainController(QObject):
             buffer_capacity=self.job_config.algorithm.buffer_capacity,
         )
 
-        # 4. 确定模型保存路径
+        # 4. 使用 CheckpointManager 确定保存路径
         if self.save_dir:
-            self.model_path = self.save_dir / "model.pth"
             self.config_dir = self.save_dir
         else:
-            config_path_str = self.file_manager.get_uav_alg_dir_path(self.mountain_name, self.config_name)
-            self.config_dir = Path(config_path_str).resolve()
-            self.model_path = self.config_dir / "model.pth"
+            self.config_dir = Path(
+                self.file_manager.get_uav_alg_dir_path(self.mountain_name, self.config_name)
+            ).resolve()
+
+        # 确保目录存在
+        self.checkpoint_manager.ensure_dirs(self.mountain_name, self.config_name)
+        self.model_path = self.checkpoint_manager.get_model_path(self.mountain_name, self.config_name)
 
         self.log(f"模型保存路径: {self.model_path}")
         self.log(f"配置文件夹路径: {self.config_dir}")
-        # 可视化全局路径和圆柱体
+
+        # 训练开始前，先清除上一次的全局路径和圆柱体
+        self.main_window.renderer.clear_global_path()
+        self.main_window.renderer.clear_cylinders()
+
+        # 可视化全局路径和圆柱体（仅在启用全局路径时）
         if self.env.use_global_path and self.env._global_waypoints is not None:
             self.main_window.renderer.draw_global_path(self.env._global_waypoints)
             self.main_window.renderer.draw_cylinder_segments(
@@ -152,68 +170,47 @@ class TrainController(QObject):
             )
             self.log("已绘制全局路径及圆柱体约束域")
 
-        # 5. 确保目录存在
-        try:
-            self.config_dir.mkdir(parents=True, exist_ok=True)
-        except Exception as e:
-            self.log(f"创建配置目录失败: {e}")
-            return
+        # 5. 使用 CheckpointManager 加载已有模型和缓冲区
+        checkpoint_info = self.checkpoint_manager.get_latest_checkpoint_info(
+            self.mountain_name, self.config_name
+        )
 
-        # 6. 确保经验文件存在（如果模型文件不存在，但缓冲区文件可能不存在，则创建空白缓冲区）
-        buffer_path = self.model_path.with_suffix('.buffer.pkl')
-        if not self.model_path.exists() and not buffer_path.exists():
-            try:
-                empty_buffer = deque(maxlen=self.job_config.algorithm.buffer_capacity)
-                with open(buffer_path, 'wb') as f:
-                    pickle.dump(empty_buffer, f)
-                self.log(f"创建空白经验文件: {buffer_path}")
-            except Exception as e:
-                self.log(f"创建空白经验文件失败: {e}，将使用内存中的空缓冲区")
-
-        # 7. 尝试加载已有模型和缓冲区
-        if self.model_path.exists():
+        if self.checkpoint_manager.model_exists(self.mountain_name, self.config_name):
             try:
                 self.agent.load(str(self.model_path), load_buffer=True)
                 self.log("已加载历史模型和缓冲区")
             except Exception as e:
                 self.log(f"加载历史模型失败: {e}，将从头开始训练")
-        else:
-            self.log("未找到历史模型，从头开始训练")
-            if buffer_path.exists():
-                try:
-                    with open(buffer_path, 'rb') as f:
-                        loaded_buffer = pickle.load(f)
-                        self.agent.replay_buffer.buffer = loaded_buffer
-                        self.agent.replay_buffer.rewards = [exp[2] for exp in loaded_buffer]
-                        self.agent.replay_buffer.threshold = -np.inf
-                        self.agent.replay_buffer.need_update = True
-                    self.log(f"已单独加载经验缓冲区: {buffer_path}")
-                except Exception as e:
-                    self.log(f"加载经验缓冲区失败: {e}")
-
-        # 8. 创建训练过程目录（轨迹保存位置）
-        self.run_dir = Path(
-            self.file_manager.create_train_dirs(
-                self.mountain_name, self.config_name, self.run_index
+        elif self.checkpoint_manager.buffer_exists(self.mountain_name, self.config_name):
+            # 只有缓冲区，单独加载
+            loaded_buffer = self.checkpoint_manager.load_buffer(
+                self.mountain_name, self.config_name
             )
-        ).resolve()
-        self.log(f"训练数据将保存至: {self.run_dir}")
+            if loaded_buffer:
+                self.agent.replay_buffer.buffer = loaded_buffer
+                self.agent.replay_buffer.rewards = [exp[2] for exp in loaded_buffer]
+                self.agent.replay_buffer.threshold = -np.inf
+                self.agent.replay_buffer.need_update = True
+                self.log("已加载经验缓冲区（无模型）")
+        else:
+            self.log("未找到历史模型和缓冲区，从头开始训练")
 
-        # 9. 从 run_dir 中推断已完成的轮次
-        max_epoch = 0
-        pattern = re.compile(r'第(\d+)轮训练过程\.npy')
-        for f in self.run_dir.iterdir():
-            m = pattern.match(f.name)
-            if m:
-                epoch_num = int(m.group(1))
-                max_epoch = max(max_epoch, epoch_num)
-        self.current_epoch = max_epoch
-        if self.current_epoch > 0:
-            self.log(f"从检查点恢复，当前进度: {self.current_epoch}/{self.total_epochs}")
+        # 6. 从 CheckpointManager 获取已完成的轮次
+        if checkpoint_info:
+            self.current_epoch = checkpoint_info.get("current_epoch", 0)
+            self.total_epochs = checkpoint_info.get("total_epochs", self.total_epochs)
+            if self.current_epoch > 0:
+                self.log(f"从检查点恢复，进度: {self.current_epoch}/{self.total_epochs}")
         else:
             self.current_epoch = 0
 
-        # 10. 启动训练
+        # 7. 创建训练过程目录（轨迹保存位置）
+        self.run_dir = self.checkpoint_manager.get_trajectories_dir(
+            self.mountain_name, self.config_name
+        )
+        self.log(f"训练数据将保存至: {self.run_dir}")
+
+        # 8. 启动训练
         self.is_training = True
         self.is_paused = False
         self.training_started.emit()
@@ -260,6 +257,7 @@ class TrainController(QObject):
         total_reward_smooth = 0.0
         total_reward_collision = 0.0
         total_reward_goal = 0.0
+        total_reward_efficiency = 0.0   # 方案2新增：飞行效率奖励
 
         while not done:
             # 选择动作
@@ -290,6 +288,7 @@ class TrainController(QObject):
             total_reward_smooth += components.get('smooth', 0.0)
             total_reward_collision += components.get('collision', 0.0)
             total_reward_goal += components.get('goal', 0.0)
+            total_reward_efficiency += components.get('efficiency', 0.0)  # 方案2新增
 
             step_data = np.concatenate([
                 next_obs[:3],
@@ -313,10 +312,10 @@ class TrainController(QObject):
 
         # 保存扩展轨迹（按间隔）
         if epoch % self.save_interval == 0 or epoch == 1:
-            save_path = self.file_manager.get_trajectory_path(
-                self.mountain_name, self.config_name, self.run_index, epoch)
-            save_npy(extended_trajectory, save_path)
-            self.log(f"已保存第{epoch}轮扩展轨迹 (13维)")
+            save_path = self.checkpoint_manager.get_trajectory_path(
+                self.mountain_name, self.config_name, epoch)
+            save_npy(extended_trajectory, str(save_path))
+            self.log(f"已保存第{epoch}轮扩展轨迹 (13维): {save_path}")
 
         # 计算统计指标
         success = (dist_to_goal <= self.env.goal_threshold) if hasattr(self.env, 'goal_threshold') else False
@@ -353,7 +352,11 @@ class TrainController(QObject):
             'reward_smooth': total_reward_smooth,
             'reward_collision': total_reward_collision,
             'reward_goal': total_reward_goal,
+            'reward_efficiency': total_reward_efficiency,  # 方案2新增：飞行效率奖励统计
         }
+
+        # 使用 CheckpointManager 保存统计信息
+        self.checkpoint_manager.append_stats(self.mountain_name, self.config_name, stats)
 
         self.epoch_completed.emit(epoch, stats)
         self.trajectory_generated.emit(pos_trajectory)
@@ -361,6 +364,15 @@ class TrainController(QObject):
         self.current_epoch += 1
         progress = self.current_epoch / self.total_epochs
         self.progress_updated.emit(progress)
+
+        # ===== 探索退火：随训练进度线性减小 exploration_bonus =====
+        # 训练初期 bonus=exploration_init（如1.5），后期退火到0
+        # 效果：早期策略大幅探索，后期收敛到稳定路径
+        if hasattr(self, 'exploration_init') and self.agent is not None:
+            exploration_bonus = max(0.0, self.exploration_init * (1.0 - progress))
+            self.agent.set_exploration_bonus(exploration_bonus)
+
+        # ===== 探索退火结束 =====
 
         # 每隔100轮更新经验池奖励阈值
         if epoch % 100 == 0:
@@ -406,32 +418,49 @@ class TrainController(QObject):
             self.agent = None
 
     def save_checkpoint(self):
-        """保存模型和经验缓冲区到指定路径"""
-        if self.agent is not None and self.model_path is not None:
-            try:
-                self.model_path.parent.mkdir(parents=True, exist_ok=True)
-                self.agent.save(str(self.model_path), save_buffer=True)
-                self.log(f"模型检查点已保存至: {self.model_path}")
-            except Exception as e:
-                self.log(f"保存模型失败: {e}")
-                import traceback
-                traceback.print_exc()
+        """保存模型、经验缓冲区和元数据到指定路径（使用 CheckpointManager）"""
+        if self.agent is None or self.model_path is None:
+            return
+
+        try:
+            # 确保目录存在
+            self.checkpoint_manager.ensure_dirs(self.mountain_name, self.config_name)
+
+            # 保存模型
+            self.agent.save(str(self.model_path), save_buffer=True)
+
+            # 保存元数据
+            self.checkpoint_manager.save_meta(
+                self.mountain_name,
+                self.config_name,
+                total_epochs=self.total_epochs,
+                current_epoch=self.current_epoch,
+                additional_info={
+                    "save_interval": self.save_interval,
+                }
+            )
+
+            self.log(f"检查点已保存: {self.model_path.parent}")
+
+        except Exception as e:
+            self.log(f"保存检查点失败: {e}")
+            import traceback
+            traceback.print_exc()
 
     def save_experience_only(self):
-        """仅保存经验缓冲区（不保存模型）"""
+        """仅保存经验缓冲区（使用 CheckpointManager）"""
         if self.agent is None or self.model_path is None:
             self.log("无法保存经验：智能体或模型路径不存在")
             return
-        try:
-            buffer_path = self.model_path.with_suffix('.buffer.pkl')
-            buffer_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(buffer_path, 'wb') as f:
-                pickle.dump(self.agent.replay_buffer.buffer, f)
-            self.log(f"经验缓冲区已保存至: {buffer_path}")
-        except Exception as e:
-            self.log(f"保存经验缓冲区失败: {e}")
-            import traceback
-            traceback.print_exc()
+
+        success = self.checkpoint_manager.save_buffer(
+            self.mountain_name,
+            self.config_name,
+            self.agent.replay_buffer.buffer
+        )
+
+        if success:
+            self.log(f"经验缓冲区已保存")
 
     def load_checkpoint(self, model_path):
         if self.agent is not None and Path(model_path).exists():
@@ -450,15 +479,17 @@ class TrainController(QObject):
         :param save_current: 是否将当前经验缓冲区保存到新目录
         """
         new_dir = Path(new_dir).resolve()
-        if self.is_training:
-            if save_current and self.agent is not None:
-                buffer_path = new_dir / "model.buffer.pkl"
-                buffer_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(buffer_path, 'wb') as f:
-                    pickle.dump(self.agent.replay_buffer.buffer, f)
-                self.log(f"[TrainController] 已将当前经验保存到新目录: {buffer_path}")
+
+        if self.is_training and save_current and self.agent is not None:
+            # 保存当前经验缓冲区
+            self.save_experience_only()
+            self.log(f"已保存当前经验缓冲区")
 
         self.save_dir = new_dir
-        self.model_path = self.save_dir / "model.pth"
-        self.config_dir = self.save_dir
-        self.log(f"[TrainController] 保存目录已更改为: {self.save_dir}")
+        self.model_path = new_dir / "model.pth"
+        self.config_dir = new_dir
+
+        # 更新 checkpoint_manager 的根目录
+        self.checkpoint_manager.root_dir = new_dir
+
+        self.log(f"保存目录已更改为: {self.save_dir}")

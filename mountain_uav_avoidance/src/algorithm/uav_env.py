@@ -8,6 +8,9 @@
 新增：支持从配置传入 max_steps，控制每回合最大步数。
 增强：step 返回的 info 字典包含更多字段用于轨迹分析和统计。
 新增：全局-局部协同机制：A* 大步长路径 + 斜圆柱体约束域，状态空间扩展为12维。
+奖励设计：基于 Potential-Based Shaping 势能重塑（单信号3D距离差分），
+          + 飞行效率奖励（速度-目标方向对齐）+ 存活步奖励。
+修正：移除距离信号三重计数（3D + XY + Z 分别差分），统一为 3D 势能差分。
 """
 
 import numpy as np
@@ -280,65 +283,112 @@ class UAVEnv(gym.Env):
         return False
 
     def _compute_reward(self, prev_pos, collision, out_of_bounds, dist_to_axis, progress, heading_error, reached_waypoint):
+        """
+        奖励计算（方案2：势能重塑版本）
+
+        设计原则：
+        1. Potential-Based Shaping：用距离势能 F(s) = -k·dist(s, goal) 驱动无人机靠近目标，
+           γ·F(s') - F(s) ≈ k·(prev_dist - new_dist)，理论保证不改变最优策略，
+           但消除稀疏奖励导致的局部最优陷阱。
+        2. 飞行效率奖励：鼓励无人机朝目标方向飞行，速度方向与目标方向对齐时给正奖励。
+        3. 平滑飞行罚项：抑制过大加速度，鼓励平稳飞行轨迹。
+        4. 存活步奖励：每步小正奖励，防止策略主动触发碰撞结束回合。
+        5. 碰撞/越界惩罚大额负分，路径跟随奖惩全局路径相关。
+        """
         config = self.algorithm_config
         new_pos = self.uav.position
-        prev_dist = np.linalg.norm(prev_pos - self.uav.goal)
-        new_dist = np.linalg.norm(new_pos - self.uav.goal)
 
-        reward_dist = 0.0
+        # ---------- 势能函数：F(s) = -k * dist_to_goal ----------
+        # Potential-Based Shaping 公式：r_shaped = r_env + γ·F(s') - F(s)
+        # 简化（γ≈1）：r_shaped ≈ r_env + [F(s') - F(s)] = r_env + k·(prev_dist - new_dist)
+        # 与原 reward_dist 类似，但物理意义更清晰，且支持更复杂的势能设计
+        prev_dist_3d = np.linalg.norm(prev_pos - self.uav.goal)
+        new_dist_3d = np.linalg.norm(new_pos - self.uav.goal)
+
+        reward_potential = 0.0
+        reward_efficiency = 0.0
         reward_smooth = 0.0
         reward_collision = 0.0
         reward_goal = 0.0
         reward_path = 0.0
         reward_progress = 0.0
         reward_out = 0.0
+        reward_alive = 0.0  # 存活步奖励
 
         if collision or out_of_bounds:
             reward_collision = config.reward_collision
+            # 无存活奖励，避免抵消碰撞惩罚
         else:
-            reward_dist = config.reward_dist * (prev_dist - new_dist)
+            # ===== 势能奖励（基于 Potential-Based Shaping）=====
+            # 使用 3D 距离差分作为单一势能信号，避免距离信号三重计数。
+            # F(s) = -k * dist_to_goal → γ*F(s') - F(s) ≈ k * (prev_dist - new_dist)
+            # reward_xy + reward_z 被移除，因为 3D 距离差分已覆盖全方向。
+            reward_potential = config.reward_dist * (prev_dist_3d - new_dist_3d)
+
+            # ===== 飞行效率奖励：速度方向与目标方向对齐 =====
+            # 鼓励无人机"向着目标飞"，而不是绕圈或横向漂移
+            vel = self.uav.velocity
+            vel_norm = np.linalg.norm(vel)
+            if vel_norm > 0.5:  # 速度足够大才计算方向对齐（避免静止时噪声）
+                to_goal = self.uav.goal - new_pos
+                to_goal_norm = np.linalg.norm(to_goal)
+                if to_goal_norm > self.goal_threshold:
+                    cos_align = np.dot(vel / vel_norm, to_goal / to_goal_norm)
+                    # cos_align ∈ [-1, 1]，只奖励正对齐（飞向目标）
+                    reward_efficiency = 0.20 * max(0.0, cos_align)
+
+            # ===== 平滑飞行奖励（保留原逻辑）=====
             reward_smooth = -config.reward_smooth * np.linalg.norm(self.uav.acceleration)
 
-            # 全局路径跟随奖励
+            # ===== 存活步奖励：每步+0.03，给予轻微正向激励防止策略主动求死，但不过度压倒目标奖励 =====
+            reward_alive = 0.03
+
+            # ===== 全局路径跟随奖励（保留原逻辑）=====
             if self.use_global_path:
-                # 偏离轴线惩罚（负值）
                 reward_path = self.reward_path_follow * dist_to_axis
-                # 进度奖励
                 if progress > 0:
                     reward_progress = self.reward_path_progress * (progress - self._last_progress)
                 self._last_progress = progress
 
-        # 到达当前路径点奖励
+        # 到达当前路径点奖励（保留原逻辑）
         if reached_waypoint:
             reward_goal += 20.0
 
-        # 最终终点奖励
-        if new_dist <= self.goal_threshold:
+        # 最终终点奖励（保留原逻辑）
+        if new_dist_3d <= self.goal_threshold:
             reward_goal += 50.0
 
-        # 超出圆柱体惩罚（单独处理，避免重复）
+        # 超出圆柱体惩罚（保留原逻辑）
         if self.use_global_path and dist_to_axis > self.cylinder_radius:
             reward_out = self.reward_out_of_cylinder
 
-        total_reward = (reward_dist + reward_smooth + reward_collision +
-                        reward_goal + reward_path + reward_progress + reward_out)
+        total_reward = (
+            reward_potential + reward_efficiency +
+            reward_smooth + reward_collision +
+            reward_goal + reward_path + reward_progress +
+            reward_out + reward_alive
+        )
 
         components = {
-            'dist': reward_dist,
+            'dist': reward_potential,         # 势能奖励（含XY/Z分量）
+            'efficiency': reward_efficiency,  # 飞行效率奖励（新增）
             'smooth': reward_smooth,
             'collision': reward_collision,
             'goal': reward_goal,
             'path_follow': reward_path,
             'progress': reward_progress,
-            'out_of_cylinder': reward_out
+            'out_of_cylinder': reward_out,
+            'alive': reward_alive,            # 存活步奖励（新增）
         }
         return total_reward, components
 
     # ---------- 环境接口 ----------
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
+
         self.uav.reset()
         self.uav.position[2] = self.abs_start_z
+
         self.uav.goal[2] = self.abs_goal_z
         self.steps = 0
         self.done = False

@@ -171,7 +171,7 @@ class AlgorithmConfig:
     buffer_capacity: int = 10000        # 经验回放缓冲区容量
 
     # 奖励函数系数
-    reward_dist: float = 1.0           # 距离奖励系数（鼓励接近目标）
+    reward_dist: float = 1.2           # 距离奖励系数（鼓励接近目标）
     reward_collision: float = -10.0    # 碰撞惩罚
     reward_smooth: float = 0.1         # 平滑奖励（鼓励平稳飞行）
 
@@ -197,9 +197,11 @@ class AlgorithmConfig:
             data["hidden_size"] = 64
         if "buffer_capacity" not in data:
             data["buffer_capacity"] = 10000
+        # 兼容旧数据：移除已废弃的 sample_mode 字段
+        data.pop("sample_mode", None)
         # 兼容旧数据：协同机制相关字段
         if "use_global_path" not in data:
-            data["use_global_path"] = False   # 旧数据默认不启用全局路径
+            data["use_global_path"] = False
         if "global_step_size" not in data:
             data["global_step_size"] = 15.0
         if "cylinder_radius" not in data:
@@ -223,6 +225,10 @@ class TrainConfig:
     log_interval: int = 10              # 日志输出间隔（轮）
     max_steps: int = 500                 # 每回合最大步数（新增）
 
+    # ===== 探索退火参数 =====
+    exploration_init: float = 1.5        # 初始探索偏置（加到 log_std 上，训练后期退火到0）
+    # ===== 探索退火参数结束 =====
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -231,6 +237,9 @@ class TrainConfig:
         # 兼容旧数据：如果没有 max_steps 字段，使用默认值 500
         if "max_steps" not in data:
             data["max_steps"] = 500
+        # 兼容旧数据：探索退火参数
+        if "exploration_init" not in data:
+            data["exploration_init"] = 1.5
         return cls(**data)
 
 

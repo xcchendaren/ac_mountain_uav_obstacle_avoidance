@@ -17,3 +17,5 @@ __pycache__/
 .env
 *.log
 *.tmp
+#腾讯龙虾
+.workbuddy/

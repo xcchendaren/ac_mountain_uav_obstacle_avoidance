@@ -18,11 +18,14 @@ from business.uav_builder import UAV
 
 def create_cylinder_between_points(p1, p2, radius, color='cyan', opacity=0.4):
     """
-    创建以p1和p2为端点的圆柱体Mesh（用于斜圆柱体）
+    创建以p1和p2为端点的斜圆柱体Mesh
     p1, p2: 三维点坐标 (x,y,z)
     radius: 圆柱半径
     color: 颜色
     opacity: 透明度
+
+    注意：圆柱体的上下底必须垂直于轴线（圆柱体侧面母线）
+    使用 pv.Tube 从线段创建，确保轴线正确
     """
     p1 = np.array(p1, dtype=np.float64)
     p2 = np.array(p2, dtype=np.float64)
@@ -30,23 +33,16 @@ def create_cylinder_between_points(p1, p2, radius, color='cyan', opacity=0.4):
     length = np.linalg.norm(vec)
     if length == 0:
         return None
-    direction = vec / length
-    cylinder = pv.Cylinder(center=(0, 0, 0), direction=(0, 1, 0),
-                           radius=radius, height=length)
-    # 旋转
-    y_axis = np.array([0, 1, 0])
-    rot_axis = np.cross(y_axis, direction)
-    dot = np.dot(y_axis, direction)
-    if np.isclose(dot, -1.0):
-        rot_axis = np.array([1, 0, 0])
-        angle = np.pi
-    else:
-        angle = np.arccos(dot)
-    if not np.isclose(angle, 0):
-        cylinder = cylinder.rotate_vector(rot_axis, np.degrees(angle), point=(0, 0, 0))
-    center = (p1 + p2) / 2
-    cylinder = cylinder.translate(center)
-    return cylinder
+
+    # 创建连接 p1 和 p2 的线段
+    line = pv.Line(p1, p2)
+
+    # 使用 Tube 滤波器创建管状体（圆柱体）
+    # Tube 会从线段生成一个半径均匀的管状圆柱体
+    # 其上下底自动垂直于轴线
+    tube = line.tube(radius=radius, n_sides=20)
+
+    return tube
 
 
 class PyVistaRenderer(QWidget):
@@ -300,6 +296,7 @@ class PyVistaRenderer(QWidget):
     def draw_cylinder_segments(self, waypoints, radius, color='cyan', opacity=0.3):
         """
         绘制沿路径的斜圆柱体段（每两个相邻路径点之间一个圆柱体）
+        端点处使用球体填充，实现平滑连接效果
         waypoints: (N, 3) 路径点坐标
         radius: 圆柱半径
         color: 颜色
@@ -308,13 +305,22 @@ class PyVistaRenderer(QWidget):
         self.clear_cylinders()
         if len(waypoints) < 2:
             return
+
+        # 1. 绘制所有圆柱体段
         for i in range(len(waypoints)-1):
             cyl = create_cylinder_between_points(waypoints[i], waypoints[i+1],
-                                                 radius=radius, color=color, opacity=opacity)
+                                                 radius=radius)
             if cyl:
                 actor = self.plotter.add_mesh(cyl, color=color, opacity=opacity, show_edges=False,
                                               reset_camera=False)
                 self.cylinder_actors.append(actor)
+
+        # 2. 在端点处绘制球体填充（实现平滑连接）
+        for i in range(len(waypoints)):
+            sphere = pv.Sphere(radius=radius, center=waypoints[i])
+            actor = self.plotter.add_mesh(sphere, color=color, opacity=opacity, show_edges=False,
+                                          reset_camera=False)
+            self.cylinder_actors.append(actor)
 
     def clear_cylinders(self):
         for actor in self.cylinder_actors:

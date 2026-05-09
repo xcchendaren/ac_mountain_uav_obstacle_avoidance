@@ -7,10 +7,10 @@ from PyQt5.QtWidgets import (
     QPushButton, QSlider, QFileDialog
 )
 from PyQt5.QtCore import Qt, QSettings
-from pyvista import examples
 
 from ui.tab_mountain import TabMountain
-from ui.tab_train import TabTrain
+from ui.tab_config import TabConfig
+from ui.tab_run import TabRun
 from ui.tab_demo import TabDemo
 from visual.renderer_pyvista import PyVistaRenderer
 from business.file_manager import FileManager
@@ -67,8 +67,10 @@ class MainWindow(QMainWindow):
 
         self.tab1 = TabMountain(self)
         self.tabs.addTab(self.tab1, "山区设置")
-        self.tab2 = TabTrain(self)
-        self.tabs.addTab(self.tab2, "训练配置")
+        self.tab_config = TabConfig(self)
+        self.tabs.addTab(self.tab_config, "训练配置")
+        self.tab_run = TabRun(self, config_tab=self.tab_config)
+        self.tabs.addTab(self.tab_run, "开始训练")
         self.tab3 = TabDemo(self)
         self.tabs.addTab(self.tab3, "训练演示")
 
